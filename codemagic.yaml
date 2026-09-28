@@ -84,8 +84,6 @@ workflows:
     name: iOS IPA
     instance_type: mac_mini_m2
     max_build_duration: 90
-    integrations:
-      app_store_connect: default
     environment:
       node: 20
       xcode: latest
@@ -99,34 +97,51 @@ workflows:
         script: |
           cd ios
           pod install
+      - name: Signing setup
+        script: |
+          # IOS_SIGNING is set by the orchestrator: 'signed' only when App Store
+          # Connect API credentials were supplied. Otherwise build unsigned.
+          if [ "${IOS_SIGNING:-unsigned}" = "signed" ]; then
+            keychain initialize
+            app-store-connect fetch-signing-files "$IOS_BUNDLE_ID" --type IOS_APP_STORE --create \
+              || { echo "ERROR: Apple signing failed. Check the App Store Connect API key and bundle ID."; exit 1; }
+            keychain add-certificates
+            xcode-project use-profiles
+          else
+            echo "No Apple signing configured: producing an UNSIGNED IPA (cannot be installed until signed)."
+          fi
       - name: Xcode archive
         script: |
           cd ios
           WORKSPACE=$(ls -d *.xcworkspace | head -n 1)
           if [ -z "$WORKSPACE" ]; then echo "ERROR: no .xcworkspace produced by expo prebuild"; exit 1; fi
           SCHEME="${XCODE_SCHEME:-${WORKSPACE%.xcworkspace}}"
-          echo "Archiving workspace=$WORKSPACE scheme=$SCHEME"
-          xcode-project use-profiles || echo "WARN: no signing profiles found; relying on automatic signing"
-          xcodebuild -workspace "$WORKSPACE" -scheme "$SCHEME" \
-            -sdk iphoneos -configuration Release \
-            -archivePath build/App.xcarchive archive \
-            -allowProvisioningUpdates \
-            || { echo "ERROR: iOS archive failed. Check that iOS signing (App Store Connect integration + certificates) is configured in Codemagic."; exit 1; }
+          echo "Archiving workspace=$WORKSPACE scheme=$SCHEME signing=${IOS_SIGNING:-unsigned}"
+          if [ "${IOS_SIGNING:-unsigned}" = "signed" ]; then
+            xcodebuild -workspace "$WORKSPACE" -scheme "$SCHEME" \
+              -sdk iphoneos -configuration Release \
+              -archivePath build/App.xcarchive archive \
+              || { echo "ERROR: iOS archive failed."; exit 1; }
+          else
+            xcodebuild -workspace "$WORKSPACE" -scheme "$SCHEME" \
+              -sdk iphoneos -configuration Release \
+              -archivePath build/App.xcarchive archive \
+              CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+              || { echo "ERROR: iOS archive failed."; exit 1; }
+          fi
       - name: Export IPA
         script: |
           cd ios
-          cat > ExportOptions.plist <<'PLIST'
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0"><dict>
-            <key>method</key><string>app-store</string>
-            <key>signingStyle</key><string>automatic</string>
-            <key>uploadSymbols</key><true/>
-          </dict></plist>
-          PLIST
-          xcodebuild -exportArchive -archivePath build/App.xcarchive \
-            -exportPath build/ipa -exportOptionsPlist ExportOptions.plist -allowProvisioningUpdates \
-            || { echo "ERROR: IPA export failed. iOS signing is not configured in Codemagic."; exit 1; }
+          mkdir -p build/ipa
+          if [ "${IOS_SIGNING:-unsigned}" = "signed" ]; then
+            xcode-project build-ipa --archive build/App.xcarchive --ipa-directory build/ipa \
+              || { echo "ERROR: IPA export failed."; exit 1; }
+          else
+            APP=$(ls -d build/App.xcarchive/Products/Applications/*.app | head -n 1)
+            if [ -z "$APP" ]; then echo "ERROR: no .app in archive"; exit 1; fi
+            rm -rf Payload && mkdir Payload && cp -R "$APP" Payload/
+            zip -qry build/ipa/App-unsigned.ipa Payload
+          fi
           ls build/ipa/*.ipa >/dev/null 2>&1 || { echo "ERROR: no IPA produced"; exit 1; }
     artifacts:
       - ios/build/ipa/*.ipa
